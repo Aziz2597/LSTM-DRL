@@ -1,0 +1,211 @@
+#Selected + HLV
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+from google.colab import drive
+from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error, r2_score
+import pickle
+
+# Mount Google Drive
+drive.mount('/content/drive')
+
+# Load Data
+df = pd.read_csv('/content/drive/My Drive/FYP/ICICI_2019_to_2024_all_sentiment.csv')
+
+def add_technical_indicators(df):
+    """Adds technical indicators and sentiment-based transformations"""
+    
+    # MACD
+    ema_12 = df['Close Price'].ewm(span=12, adjust=False).mean()
+    ema_26 = df['Close Price'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = ema_12 - ema_26
+    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+    # Momentum & Rate of Change (ROC)
+    df['Momentum'] = df['Close Price'].diff(periods=10)
+
+    # ADX
+    up_move = df['High Price'].diff()
+    down_move = df['Low Price'].diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+    tr = np.maximum(df['High Price'] - df['Low Price'],
+                   np.maximum(abs(df['High Price'] - df['Close Price'].shift(1)),
+                             abs(df['Low Price'] - df['Close Price'].shift(1))))
+    atr = tr.rolling(window=14).mean()
+    plus_di = (100 * pd.Series(plus_dm).rolling(window=14).mean()) / atr
+    minus_di = (100 * pd.Series(minus_dm).rolling(window=14).mean()) / atr
+    df['ADX'] = ((abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)) * 100).rolling(window=14).mean()
+
+    # Bollinger Bands
+    df['BB_Mid'] = df['Close Price'].rolling(window=20).mean()
+    std_dev = df['Close Price'].rolling(window=20).std()
+    df['BB_Upper'] = df['BB_Mid'] + (std_dev * 2)
+    df['BB_Lower'] = df['BB_Mid'] - (std_dev * 2)
+    df['BB_Width'] = df['BB_Upper'] - df['BB_Lower']
+
+    # Sentiment Moving Averages
+    df['Indian_Sentiment_SMA_14'] = df['Indian_sentiment_score'].rolling(window=14).mean()
+    df['ET_Sentiment_SMA_14'] = df['ET_net_sentiment_score'].rolling(window=14).mean()
+    df['Foreign_Sentiment_SMA_14'] = df['foreign_sentiment_score'].rolling(window=14).mean()
+
+    return df
+
+# Apply feature engineering
+df = add_technical_indicators(df)
+df.dropna(inplace=True)
+
+# Select target and feature columns
+columns = ['Open Price', 'Close Price', 'MACD', 'BB_Width', 'Indian_Sentiment_SMA_14', 
+           'Volume', 'Foreign_Sentiment_SMA_14', 'Momentum', 'ADX']
+data = df[columns].values
+
+# Convert date and find split points
+df['Date'] = pd.to_datetime(df['Date'], format='%d-%m-%Y')
+print(f"Date Range: {df['Date'].min()} to {df['Date'].max()}")
+
+# Split into train/val/test BEFORE scaling
+train_size_orig = int(0.7 * len(df))
+val_size_orig = int(0.15 * len(df))
+test_size_orig = len(df) - train_size_orig - val_size_orig
+
+# Initialize MinMaxScaler and scale the data properly
+scaler = MinMaxScaler()
+scaler.fit(data[:train_size_orig])  # Fit only on training data
+data_scaled = scaler.transform(data)
+
+# Save scaler for later use
+scaler_path = '/content/drive/My Drive/Colab Notebooks/LSTM_scaler.pkl'
+with open(scaler_path, 'wb') as f:
+    pickle.dump(scaler, f)
+
+def create_rolling_sequences(data_scaled, window_size):
+    """Create sequences for LSTM training"""
+    X, y = [], []
+    for i in range(len(data_scaled) - window_size):
+        X.append(data_scaled[i:i + window_size])
+        y.append(data_scaled[i + window_size, 0])  # Predict next day's open price
+    return np.array(X), np.array(y)
+
+# Define the window size
+w = 10
+
+# Create sequences
+X, y = create_rolling_sequences(data_scaled, window_size=w)
+
+# Get correct indices for each set based on original split points
+train_end_orig = train_size_orig
+val_end_orig = train_size_orig + val_size_orig
+
+train_seq_indices = [i for i in range(len(X)) if (i + w) < train_end_orig]
+val_seq_indices = [i for i in range(len(X)) if (i + w) >= train_end_orig and (i + w) < val_end_orig]
+test_seq_indices = [i for i in range(len(X)) if (i + w) >= val_end_orig]
+
+X_train, y_train = X[train_seq_indices], y[train_seq_indices]
+X_val, y_val = X[val_seq_indices], y[val_seq_indices]
+X_test, y_test = X[test_seq_indices], y[test_seq_indices]
+
+# Print dataset ranges
+print(f"\nTraining Set Date Range: {df.iloc[w]['Date']} to {df.iloc[train_end_orig-1]['Date']}")
+print(f"Validation Set Date Range: {df.iloc[train_end_orig]['Date']} to {df.iloc[val_end_orig-1]['Date']}")
+print(f"Testing Set Date Range: {df.iloc[val_end_orig]['Date']} to {df.iloc[-1]['Date']}")
+
+def inverse_transform(y_scaled, data_scaled, indices):
+    """Proper inverse transform using actual feature values"""
+    dummy = np.zeros((len(y_scaled), data_scaled.shape[1]))
+    for i, idx in enumerate(indices):
+        dummy[i] = data_scaled[idx + w]  # Get corresponding original data point
+        dummy[i, 0] = y_scaled[i]  # Replace open price with prediction
+    return scaler.inverse_transform(dummy)[:, 0]
+
+# Build improved model
+model = Sequential([
+    LSTM(64, activation='tanh', return_sequences=True, input_shape=(w, X.shape[2])),
+    LSTM(32, activation='tanh', return_sequences=False),
+    Dense(1)
+])
+
+model.compile(optimizer='adam', loss='mse')
+
+
+# Train the model
+history = model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    epochs=120,
+    batch_size=32,
+    verbose=1
+)
+
+# Predictions
+y_train_pred = model.predict(X_train)
+y_val_pred = model.predict(X_val)
+y_test_pred = model.predict(X_test)
+
+# Inverse transform using correct indices
+y_train_rescaled = inverse_transform(y_train, data_scaled, train_seq_indices)
+y_val_rescaled = inverse_transform(y_val, data_scaled, val_seq_indices)
+y_test_rescaled = inverse_transform(y_test, data_scaled, test_seq_indices)
+
+y_train_pred_rescaled = inverse_transform(y_train_pred, data_scaled, train_seq_indices)
+y_val_pred_rescaled = inverse_transform(y_val_pred, data_scaled, val_seq_indices)
+y_test_pred_rescaled = inverse_transform(y_test_pred, data_scaled, test_seq_indices)
+
+def evaluate(y_true, y_pred, dataset_name):
+    """Comprehensive evaluation metrics"""
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mape = mean_absolute_percentage_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    print(f"{dataset_name} - MAE: {mae:.4f}, RMSE: {rmse:.4f}, MAPE: {mape * 100:.2f}%, R² Score: {r2:.4f}")
+    return mae, rmse, mape
+    
+    return mae, rmse, mape, r2
+
+# Evaluate all sets
+train_metrics = evaluate(y_train_rescaled, y_train_pred_rescaled, "Training")
+val_metrics = evaluate(y_val_rescaled, y_val_pred_rescaled, "Validation")
+test_metrics = evaluate(y_test_rescaled, y_test_pred_rescaled, "Testing")
+
+# Plot training history
+plt.figure(figsize=(10, 6))
+plt.plot(history.history['loss'], label='Training Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.title('Loss during Training')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+plt.show()
+
+# Plot predictions vs actual values for test set
+plt.figure(figsize=(10, 6))
+plt.plot(y_test_rescaled, label='Actual')
+plt.plot(y_test_pred_rescaled, label='Predicted')
+plt.title('Actual vs Predicted (Test Set)')
+plt.xlabel('Time Steps')
+plt.ylabel('Open Price')
+plt.legend()
+plt.show()
+
+# Plot predictions vs actual values for validation set
+plt.figure(figsize=(10, 6))
+plt.plot(y_val_rescaled, label='Actual')
+plt.plot(y_val_pred_rescaled, label='Predicted')
+plt.title('Actual vs Predicted (Validation Set)')
+plt.xlabel('Time Steps')
+plt.ylabel('Open Price')
+plt.legend()
+plt.show()
+
+def train_and_save_lstm(data, window_size=10):
+    model.save('your_lstm_model.h5')
+    print("✅ LSTM model trained and saved as 'your_lstm_model.h5'")
+    return model
+
+lstm_model = train_and_save_lstm(data, window_size=10)
